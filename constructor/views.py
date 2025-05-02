@@ -1,27 +1,46 @@
-from datetime import datetime
+import uuid
 
-from rest_framework import viewsets, status
+from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAdminUser, IsAuthenticated, AllowAny
+from rest_framework.permissions import SAFE_METHODS
+from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.views import APIView
+
+from .permissions import IsOwnerOrAdmin, IsOwnerMatchingUsername
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticatedOrReadOnly, IsAuthenticated
+from rest_framework import status
 
-from .permissions import IsOwnerMatchingUsername, IsStaffOrSuperUser
-from .serializers import *
-
-class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.all()
-    serializer_class = UserSerializerCrud
-    permission_classes = (IsAuthenticated, IsStaffOrSuperUser)
+from .models import Category, Service, ServiceImage, PartyConstructor, Order
+from .serializers import (
+    CategorySerializer,
+    ServiceSerializer,
+    ServiceImageSerializer,
+    PartyConstructorSerializer,
+    OrderSerializer, PartyConstructorDetailSerializer
+)
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    permission_classes = (IsAuthenticatedOrReadOnly, )
+
+    def get_permissions(self):
+        if self.request.method in SAFE_METHODS:
+            return [AllowAny()]  # Allow GET, HEAD, OPTIONS for everyone
+        return [IsAdminUser()]  # Restrict POST, PUT, DELETE to admin
+
 
 class ServiceViewSet(viewsets.ModelViewSet):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
-    permission_classes = (IsAuthenticatedOrReadOnly, )
+
+    def get_permissions(self):
+        return [IsOwnerOrAdmin()]
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
 
     def get_queryset(self):
         queryset = Service.objects.all()
@@ -34,7 +53,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
             #     filter_date = make_aware(datetime.strptime(date_filter, '%Y-%m-%d'))
             #     queryset = queryset.filter(availability_date__gte=filter_date)
             # except ValueError:
-                pass  # Ignore invalid date formats
+            pass  # Ignore invalid date formats
 
         # Handle 'category' filter
         category_filter = params.get('category', None)
@@ -61,90 +80,118 @@ class ServiceViewSet(viewsets.ModelViewSet):
         elif capacity_max:
             queryset = queryset.filter(capacity__lte=capacity_max)
 
+        # Randomize the queryset
+        queryset = queryset.order_by('?')
+
         return queryset
+
+
+class ServiceImageViewSet(viewsets.ModelViewSet):
+    queryset = ServiceImage.objects.all()
+    serializer_class = ServiceImageSerializer
+    parser_classes = [MultiPartParser, FormParser]
+
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                'image',
+                openapi.IN_FORM,
+                description="Image file to upload",
+                type=openapi.TYPE_FILE,
+                required=True,
+            ),
+            openapi.Parameter(
+                'service',
+                openapi.IN_FORM,
+                description="Service name associated with the image",
+                type=openapi.TYPE_STRING,
+                required=True,
+            ),
+        ],
+        operation_description="Upload an image for a service",
+        responses={201: ServiceImageSerializer}
+    )
+    def create(self, request, *args, **kwargs):
+        service_id = request.data.get('service')
+        try:
+            service = Service.objects.get(id=service_id)
+        except Service.DoesNotExist:
+            return Response(
+                {"detail": "Service not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if service.owner != request.user and not request.user.is_staff:
+            return Response(
+                {"detail": "You do not have permission to add images to this service."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        service_image = self.get_object()
+        service = service_image.service
+
+        if service.owner != request.user:
+            return Response(
+                {"detail": "You do not have permission to update images for this service."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        return super().update(request, *args, **kwargs)
+
+    def get_permissions(self):
+        if self.request.method in SAFE_METHODS:
+            return [IsAuthenticated()]
+        return [IsOwnerOrAdmin()]
 
 class PartyConstructorViewSet(viewsets.ModelViewSet):
     queryset = PartyConstructor.objects.all()
     serializer_class = PartyConstructorSerializer
 
-    def create(self, request, *args, **kwargs):
-        # Ensure that the request data is valid before processing
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            # Handle the create logic, which includes saving the services
-            party_constructor = serializer.save()
-            return Response(self.get_serializer(party_constructor).data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    def update(self, request, *args, **kwargs):
-        # Update the PartyConstructor and handle services
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        if serializer.is_valid():
-            party_constructor = serializer.save()
-            return Response(self.get_serializer(party_constructor).data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    def get_permissions(self):
+        return [IsOwnerOrAdmin()]
 
 
+class OrderViewSet(viewsets.ModelViewSet):
+    queryset = Order.objects.all()
+    serializer_class = OrderSerializer
+
+    def get_permissions(self):
+        return [IsOwnerOrAdmin()]
 
 class PartyConstructorDetailView(viewsets.ModelViewSet):
-    queryset = PartyConstructor.objects.all()
     serializer_class = PartyConstructorDetailSerializer
-    permission_classes = (IsAuthenticated,IsOwnerMatchingUsername)
+    permission_classes = (IsAuthenticated,)  # No need for custom permission if you filter by user
+
+    def get_queryset(self):
+        return PartyConstructor.objects.filter(user=self.request.user)
 
     def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
+        instance = self.get_object()  # Already restricted by get_queryset
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
-    def user(self, request):
-        username = request.query_params.get('username')
-        user_id = request.query_params.get('id')
-
-        if not username or not user_id:
-            return Response({'error': 'username and id are required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = uuid.UUID(user_id)
-        except ValueError:
-            return Response({'error': 'Invalid UUID format'}, status=status.HTTP_400_BAD_REQUEST)
-
-        queryset = PartyConstructor.objects.select_related('user').prefetch_related('services').filter(
-            user__id=user_id,
-            user__username=username
-        )
-
-        if not queryset.exists():
-            return Response({'error': 'PartyConstructor not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        serializer = self.get_serializer(queryset, many=True)  # <-- many=True because now it's a list
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'])
-
     def by(self, request):
-
-        username = request.query_params.get('username')
-
         party_id = request.query_params.get('party_id')
 
-        if not username or not party_id:
-            return Response({'error': 'username, id, and party_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not party_id:
+            return Response({'error': 'party_id is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            party_id = uuid.UUID(party_id)
+            party_uuid = uuid.UUID(party_id)
         except ValueError:
             return Response({'error': 'Invalid UUID format'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             instance = PartyConstructor.objects.select_related('user').prefetch_related('services').get(
-                id=party_id,
-                user__username=username
+                id=party_uuid,
+                user=request.user
             )
         except PartyConstructor.DoesNotExist:
-            return Response({'error': 'PartyConstructor not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'PartyConstructor not found or unauthorized'}, status=status.HTTP_404_NOT_FOUND)
 
         serializer = self.get_serializer(instance)
         return Response(serializer.data)

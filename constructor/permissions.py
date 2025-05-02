@@ -1,5 +1,11 @@
-from rest_framework import permissions
-from rest_framework.permissions import BasePermission
+from rest_framework.permissions import BasePermission, SAFE_METHODS
+
+class IsOwnerOrAdmin(BasePermission):
+    def has_object_permission(self, request, view, obj):
+        if request.method in SAFE_METHODS:
+            return request.user.is_authenticated
+        return request.user.is_staff or obj.owner == request.user
+
 
 class IsOwnerMatchingUsername(BasePermission):
     """
@@ -24,12 +30,3 @@ class IsOwnerMatchingUsername(BasePermission):
                 return False
 
         return True
-
-class IsStaffOrSuperUser(permissions.BasePermission):
-    """
-    Custom permission to only allow access to staff or superuser.
-    """
-
-    def has_permission(self, request, view):
-        # Check if the user is staff or a superuser
-        return request.user and (request.user.is_staff or request.user.is_superuser)
